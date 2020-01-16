@@ -1,10 +1,15 @@
 #!/usr/bin/python3
+# -*- coding: UTF-8 -*-
+# Copyright (C), SBS Science & Technology Co., Ltd. 
+# Author: LiShaocheng
 
 import os
-import socketserver
+import socket
 import argparse
 import serial
 import threading
+import json
+import struct
 
 lock = threading.Lock()
 
@@ -12,63 +17,80 @@ class ATCmdException(Exception):
     def __init__(self, msg):
         self.msg = msg
 
-class at_server(socketserver.BaseRequestHandler):
-    def handle(self):
-        data = self.request[0]
-        conn = self.request[1]
-        addr = self.client_address
-
-        args = data.decode().split()
-        dev = args[0]
-        cmd = args[1]
-        # send at command
-        lock.acquire()
-        try:
-            lines = self.send_command(dev,cmd)
-        except ATCmdException as e:
-            msg = "error:\r\n{0}".format(e)
-            conn.sendto(msg.encode(), addr)
-        else:
-            # bytes list to string, send result to client
-            result = []
-            for line in lines :
-                result.append(line.decode())
-            msg = ''.join(result)
-            print(msg)
-            conn.sendto(msg.encode(), addr)
-        finally:
-            lock.release()      
-
-    def send_command(self, dev, cmd):
-        cmd = cmd+"\r"
+# 向 dev 串口发送一个指令 cmd ，返回值是一个 bytes 列表，按 '\r\n' 分割
+def send_command(dev, cmd):
         # open and write
         try:
-            ser = serial.Serial(port=dev, baudrate=115200, timeout=float(1))
+            ser = serial.Serial(port=dev, baudrate=115200, timeout=0.5)
             ser.reset_input_buffer()
             ser.reset_output_buffer()
             ser.write(cmd.encode())
-        except serial.SerialException as e:            
+        except serial.SerialException as e:
             raise ATCmdException(e)
-        # read
-        lines = ser.readlines()
-        if len(lines) == 0:
+        # read 
+        result = ser.readlines()
+        if len(result) == 0:
             raise ATCmdException("Read timeout")
         if ser.isOpen():
             ser.close()
         # return
-        return(lines)
+        return(result)
+
+def data_pack(version, msg):
+    msg_len = len(msg) 
+    data = struct.pack('2B%ds'%msg_len, version, msg_len, msg)
+    return data
+
+def handle(conn):
+    t_name = threading.current_thread().name
+    with conn :
+        # 接收并解析数据帧的头部
+        head = conn.recv(2, socket.MSG_WAITALL)
+        head = struct.unpack('2B',head)
+        version = head[0]
+        msg_len = head[1]
+        # 接收并解析数据帧的载荷
+        msg = conn.recv(msg_len, socket.MSG_WAITALL)
+        msg = json.loads(msg.decode())
+        
+        lock.acquire()
+        print(t_name, " : ", msg)
+        try:
+            result = send_command(msg['dev'], msg['cmd'])
+        except ATCmdException as e:
+            err = "Error:\r\n{0}".format(e)
+            conn.sendall(err.encode())
+        else:            
+            # 将 bytes 列表中的元素合并为一个 bytes 变量
+            msg = b''
+            for l in result :
+                msg = msg + l 
+            # 打包数据帧
+            data = data_pack(version, msg)            
+            # 将返回的数据发给客户端
+            conn.sendall(data)
+            print(t_name, " : ", data, '\r\n')
+        finally:            
+            lock.release()    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AT command server.")
-    parser.add_argument("port", type=int, default=10001, help="UDP port")
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1")
+    parser.add_argument("-s", dest="sock", default="/run/atserver.socket", help="unix socket file")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.2")
     args = parser.parse_args()
-    
-    server = socketserver.ThreadingUDPServer(("localhost", args.port), at_server)
-    print("Listenning ...")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("Close socket")
-        server.shutdown()
-        server.server_close()
+
+    sock = args.sock
+    if os.path.exists(sock):
+        os.remove(sock)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s :
+        s.bind(sock)
+        s.listen()
+        print("Start listen ", sock)
+        while True :
+            conn, _ = s.accept()            
+            t = threading.Thread(target=handle, args=(conn, ))
+            t.start()
+
+    os.remove(sock)
+

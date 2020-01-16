@@ -1,0 +1,117 @@
+#!/bin/bash
+#
+# Description: use this script file to get the 3G Modem information
+#              or other devices information by AT command.
+
+RESPONSE="/tmp/.atresponse"
+DeviceStatus="ready"
+DEBUG="N"
+
+DBG_ERR() {
+	[ "$DEBUG" == "Y" ] && echo $1 >&2
+}
+
+do_atcommand() {
+	atcommand=$1
+
+        #cat will read the response, then die on timeout
+        cat <&5 >$RESPONSE 2>/dev/null &
+
+	DBG_ERR "CMD:$atcommand"
+        echo -ne "$atcommand\r\n" >&5 2>/dev/null || {
+		DBG_ERR "Device busying!"
+		return 1
+	}
+
+        #wait for cat to die
+        wait $!
+
+	return 0
+}
+
+show_help() {
+	echo "Usage: atcommand -h/--help"
+	echo "Usage: atcommand [-v] dev default-command or atcommand dev -cmd ATxxxx"
+	echo "-v:               output error message to stderr"
+	echo "-h, --help:       show this help menu"
+	echo "dev:              device like ttyACM0 or /dev/ttyACM0"
+	echo "default-command:"
+	echo "    manufacturer: return 3G modem manufacturer name by AT+CGMI"
+	echo "    product:      return 3G modem product name by AT+CGMM"
+	echo "    revision:     return 3G modem software revision by AT+CGMR"
+	echo "    sn:           return 3G modem serial number by AT+CGSN"
+	echo "    imsi:         return SIM card IMSI by AT+CIMI "
+	echo "-cmd command:"
+	echo "    -cmd ATxxxx   return the result this AT command"
+}
+
+[ "$1" == "-h" -o "$1" == "--help" ] && {
+	show_help
+	exit 0
+}
+
+[ "$1" == "-v" ] && {
+	DEBUG="Y"
+	shift
+}
+
+dev=$1
+echo $dev | grep "/dev/" >/dev/null 2>&1 || dev="/dev/$dev"
+[ -n "$dev" -a -e "$dev" ] || {
+	DBG_ERR "Not exist device: $dev"
+	exit 1
+}
+
+case "$2" in
+manufacturer)
+	cmd="AT+CGMI";;
+product)
+	cmd="AT+CGMM";;
+revision)
+	cmd="AT+CGMR";;
+sn)
+	cmd="AT+CGSN";;
+imsi)
+	cmd="AT+CIMI";;
+-cmd)
+	[ -n "$3" ] && cmd=$3
+	[ -z "$3" ] && show_help && exit 1
+	;;
+*)
+	show_help
+	exit 1
+	;;
+esac
+
+RETRIES=5
+while [ $RETRIES -gt 0 ]
+do
+	# Clear old response result file
+	echo > $RESPONSE
+
+	# Set modem with timeout of 5/10 a second
+	stty -F $dev 115200 -echo igncr -icanon onlcr ixon min 0 time 5 2>/dev/null
+
+	# Open modem on FD 5
+	exec 5<>$dev
+
+	echo "debug:$cmd"
+	do_atcommand "$cmd" || RETRIES=1
+
+	result=`cat $RESPONSE | sed '/^$/d' | sed "/$cmd/d" | sed -ne '1p'`
+	[ -n "$result" ] && {
+		echo "$result" | grep -q "ERROR" || {
+			echo $result
+			RETRIES=1
+		}
+	}
+
+	# Close FD5
+	exec 5<&-
+
+	let RETRIES=RETRIES-1
+done
+
+rm -f $RESPONSE
+
+# End Of File
